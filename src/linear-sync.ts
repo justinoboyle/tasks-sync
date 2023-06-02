@@ -7,6 +7,10 @@ import { authenticate } from "@google-cloud/local-auth";
 import fs from "fs/promises";
 import { LinearClient } from "@linear/sdk";
 import moment from "moment";
+import {
+  updateTaskList as updateTaskList,
+  registerSendListener,
+} from "./telegram.js";
 
 const credentials = path.join(process.cwd(), "credentials.json");
 
@@ -14,6 +18,19 @@ const scopes = ["https://www.googleapis.com/auth/tasks"];
 const token = path.join(process.cwd(), "token.json");
 
 let tokenExists = false;
+
+// nextDay
+const nextDay = () => {
+  // 2 days from now, if that's a weekend, monday
+  const twoDaysFromNow = moment().add(2, "days");
+  if (twoDaysFromNow.day() === 0) {
+    return moment().add(3, "days");
+  }
+  if (twoDaysFromNow.day() === 6) {
+    return moment().add(4, "days");
+  }
+  return twoDaysFromNow;
+};
 
 // check token file
 try {
@@ -45,6 +62,15 @@ let tokenData = await fs.readFile(token, "utf-8");
 const auth = new google.auth.OAuth2();
 auth.setCredentials(JSON.parse(tokenData));
 
+auth.on("tokens", (tokens) => {
+  if (tokens.refresh_token) {
+    console.log("New refresh token! Saving to file!");
+    tokenData = JSON.stringify(tokens);
+    // old token
+    fs.writeFile(token, tokenData);
+  }
+});
+
 const tasks = google.tasks({
   version: "v1",
   auth: auth,
@@ -54,6 +80,107 @@ const log = (...messages: string[]) => {
   const nowDate = moment.utc().format("YYYY-MM-DD HH:mm:ss");
   console.log(`[Linear sync ${nowDate}]`, ...messages);
 };
+
+registerSendListener(async (message, method) => {
+  // method is the ID
+  const tasklists = await tasks.tasklists.list();
+
+  // pick task list named General
+  const generalTaskList = tasklists?.data?.items?.find(
+      (tasklist) => tasklist.title === "General"
+    ),
+    generalTaskListId = generalTaskList?.id;
+
+  if (method == "add") {
+    // new task
+    // add a task with the message
+    if (!generalTaskListId) {
+      console.error("No General task list found!");
+      return;
+    }
+
+    // title is the first line. if there are more than 1 line, its desc
+
+    const title = message.split("\n")[0],
+      desc = message.split("\n").slice(1).join("\n");
+
+    await tasks.tasks.insert({
+      tasklist: generalTaskListId,
+      requestBody: {
+        title: title + "",
+        notes: desc,
+        kind: "tasks#task",
+        due: nextDay().format() + "",
+      },
+    });
+
+    // send the tasklist again
+    await updateTaskListInTelegram(generalTaskListId);
+
+    return;
+  }
+  if (method == "done") {
+    // done task
+
+    if (!generalTaskListId) {
+      console.error("No General task list found!");
+      return;
+    }
+
+    // list all tasks in general
+    const generalTasks = await tasks.tasks.list({
+        tasklist: generalTaskListId,
+      }),
+      generalTasksData = generalTasks?.data?.items;
+
+    // find one with the id
+    const task = generalTasksData?.find((task) => task.id === message);
+
+    if (!task) {
+      console.error("No task found with ID " + message);
+      return;
+    }
+
+    // mark as done
+    await tasks.tasks.update({
+      tasklist: generalTaskListId,
+      task: method,
+      requestBody: {
+        ...task,
+        status: "completed",
+      },
+    });
+    // send the tasklist again
+    await updateTaskListInTelegram(generalTaskListId);
+    return;
+  }
+});
+
+async function updateTaskListInTelegram(generalTaskListId: string) {
+  const generalTasks = await tasks.tasks.list({
+      tasklist: generalTaskListId,
+    }),
+    generalTasksData = generalTasks?.data?.items;
+
+  // get not completed tasks
+  const notCompletedTasks = generalTasksData?.filter(
+    (task) => task.status !== "completed"
+  );
+  // generate task list
+  const taskList = notCompletedTasks
+    ?.map((task: any) => `${task.title}\n/t${task.id}`)
+    .join("\n\n");
+
+  // escape markdown in tasklist
+  const escapeMarkdown = (text: string) => {
+    // including dash
+    return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+  };
+
+  updateTaskList(
+    `*${notCompletedTasks?.length} /tasks*\n\n` + escapeMarkdown(taskList || "")
+  );
+}
 
 async function task() {
   log("Starting task");
@@ -86,19 +213,6 @@ async function task() {
   const myIssues = await me.assignedIssues();
 
   log("Linear - got " + myIssues.nodes.length + " issues assigned to me");
-
-  // nextDay
-  const nextDay = () => {
-    // 2 days from now, if that's a weekend, monday
-    const twoDaysFromNow = moment().add(2, "days");
-    if (twoDaysFromNow.day() === 0) {
-      return moment().add(3, "days");
-    }
-    if (twoDaysFromNow.day() === 6) {
-      return moment().add(4, "days");
-    }
-    return twoDaysFromNow;
-  };
 
   const issues = myIssues.nodes
     .filter(
@@ -142,12 +256,13 @@ async function task() {
       },
     });
   });
+  await updateTaskListInTelegram(generalTaskListId);
 }
 
 export const init = async () => {
   log("Starting linear-sync");
   await task();
 
-  // every 15 minutes, run task
-  setInterval(task, 15 * 60 * 1000);
+  // every 10 minutes, run task
+  setInterval(task, 10 * 60 * 1000);
 };
