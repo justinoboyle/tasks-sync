@@ -176,8 +176,6 @@ dist
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,node
 
-build
-build/*
 .env
 
 token.json
